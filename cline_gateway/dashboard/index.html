@@ -901,7 +901,11 @@ api_key: ${esc(s.admin_key)}   # or any client key</p>
     });
     try {
       const r = await api("/admin/dash/settings", {method:"PUT", body:{values}});
-      document.querySelectorAll("[data-set]").forEach(el => { el.dataset.orig = el.value; });
+      // stamp only the fields that were submitted, with their submitted value:
+      // an edit made while the request was in flight must stay dirty
+      document.querySelectorAll("[data-set]").forEach(el => {
+        if (el.dataset.set in values) el.dataset.orig = values[el.dataset.set];
+      });
       toast(r.changed.length ? `saved ${r.changed.length} setting(s) — restart applies`
                              : "no changes", "ok");
     } catch (e) { toast("save: " + e.message, "err"); }

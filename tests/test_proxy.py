@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import yaml
 
 from cline_gateway.config import Config, UpstreamConfig, load_config
 from cline_gateway.model_catalog import ModelCatalog
@@ -56,3 +57,59 @@ def test_config_yaml_and_env_override(tmp_path, monkeypatch):
 
     monkeypatch.setenv("CLINE_GATEWAY_UPSTREAM__PROXY", HTTP)
     assert load_config(cfg_file).upstream.proxy == HTTP
+
+
+# --------------------------------------------------------------------------- #
+# settings-save validation: reject a bad proxy before it reaches config.yaml
+# (a value httpx cannot construct on would stop the gateway booting at all)
+# --------------------------------------------------------------------------- #
+
+def _put_proxy(tmp_path, monkeypatch, value: str):
+    """PUT upstream.proxy through the dashboard settings endpoint."""
+    from fastapi.testclient import TestClient
+
+    from cline_gateway.app import create_app
+
+    monkeypatch.chdir(tmp_path)
+    conf = tmp_path / "config.yaml"
+    conf.write_text("server:\n  port: 9997\n", encoding="utf-8")
+    cfg = load_config(conf)
+    # hermetic: no real accounts/store/logs, no background pollers
+    cfg.update.enabled = False
+    cfg.pool.balance_poll_seconds = 0
+    cfg.accounts.source = "pool_file"
+    cfg.accounts.pool_file = str(tmp_path / "empty.json")
+    (tmp_path / "empty.json").write_text('{"accounts": []}', encoding="utf-8")
+    cfg.store.sqlite_path = str(tmp_path / "g.db")
+    cfg.logging.capture_dir = str(tmp_path / "logs")
+
+    app = create_app(cfg)
+    with TestClient(app) as client:
+        resp = client.put("/admin/dash/settings",
+                          headers={"Authorization":
+                                   f"Bearer {cfg.server.admin_key}"},
+                          json={"values": {"upstream.proxy": value}})
+    return resp, conf
+
+
+def test_settings_reject_unsupported_proxy(tmp_path, monkeypatch):
+    resp, conf = _put_proxy(tmp_path, monkeypatch, "ftp://127.0.0.1:1080")
+    assert resp.status_code == 400
+    assert "scheme" in resp.json()["detail"]
+    written = yaml.safe_load(conf.read_text(encoding="utf-8"))
+    assert "proxy" not in (written.get("upstream") or {})   # rejected pre-write
+
+
+def test_settings_reject_proxy_without_scheme(tmp_path, monkeypatch):
+    resp, _ = _put_proxy(tmp_path, monkeypatch, "127.0.0.1:1080")
+    assert resp.status_code == 400
+    assert "scheme" in resp.json()["detail"]
+
+
+def test_settings_accepts_proxy_schemes_and_empty(tmp_path, monkeypatch):
+    for value in ("socks5h://127.0.0.1:1080", "http://127.0.0.1:10809", ""):
+        resp, conf = _put_proxy(tmp_path, monkeypatch, value)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["changed"] == ["upstream.proxy"]
+        written = yaml.safe_load(conf.read_text(encoding="utf-8"))
+        assert written["upstream"]["proxy"] == value
